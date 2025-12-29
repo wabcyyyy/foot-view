@@ -1,0 +1,18 @@
+[project]
+name = "foot-view"
+version = "0.1.0"
+description = "Gait Analysis System with Flask and Vue"
+requires-python = ">=3.8"
+dependencies = [
+    "flask",
+    "flask-sqlalchemy",
+    "flask-login",
+    "werkzeug",
+    "opencv-python-headless",
+    "pandas",
+    "numpy<2.0",
+    "scipy"
+]
+
+[tool.uv]
+dev-dependencies = []

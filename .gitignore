@@ -1,0 +1,59 @@
+# 忽略上传的视频文件
+/uploads/
+/uploads/*.mp4
+
+# 忽略输出文件夹（通常包含处理后的视频或图像）
+/outputs/
+/outputs/*
+
+# 忽略视频文件夹
+/Videos/
+/Videos/*
+
+# 忽略可能的大文件
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.wmv
+*.flv
+*.webm
+
+# 忽略可能的大型输出文件
+*.zip
+*.rar
+*.7z
+
+# Python相关
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+.venv/
+venv/
+.venv/
+venv.bak/
+ENV/
+instance/
+
+# 前端相关
+node_modules/
+dist/
+build/
+.npm/
+
+# IDE相关
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 日志文件
+*.log
+
+# 环境变量文件
+.env
+.env.local
+.env.*.local

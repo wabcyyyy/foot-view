@@ -2,6 +2,7 @@ import { createRouter, createWebHistory } from 'vue-router'
 import Home from '../views/Home.vue'
 import Result from '../views/Result.vue'
 import Login from '../views/Login.vue'
+import MetricDetail from '../views/MetricDetail.vue'
 import axios from 'axios'
 
 const routes = [
@@ -20,6 +21,13 @@ const routes = [
     path: '/result/:filename',
     name: 'Result',
     component: Result,
+    props: true,
+    meta: { requiresAuth: true }
+  },
+  {
+    path: '/metric/:metricName',
+    name: 'MetricDetail',
+    component: MetricDetail,
     props: true,
     meta: { requiresAuth: true }
   }

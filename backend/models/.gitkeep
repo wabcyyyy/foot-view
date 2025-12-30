@@ -1,0 +1,2 @@
+# 此文件确保 models 目录被 Git 跟踪
+# 模型文件 (.pt) 被 .gitignore 排除

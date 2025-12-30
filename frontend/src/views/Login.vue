@@ -31,7 +31,7 @@
           />
         </div>
 
-        <!-- 注册时的确认密码框，带有高度过渡动画 -->
+        <!-- 注册时的额外字段，带有高度过渡动画 -->
         <div class="expand-wrapper" :class="{ 'is-expanded': !isLoginMode }">
           <div class="input-group">
             <input
@@ -41,6 +41,29 @@
               @keyup.enter="handleAuth"
               ref="confirmInput"
             />
+          </div>
+          <div class="input-group">
+            <input
+              type="email"
+              v-model="email"
+              placeholder="邮箱地址"
+            />
+          </div>
+          <div class="input-group verification-group">
+            <input
+              type="text"
+              v-model="verificationCode"
+              placeholder="验证码"
+              maxlength="6"
+              @keyup.enter="handleAuth"
+            />
+            <button 
+              class="send-code-btn" 
+              @click="sendVerificationCode"
+              :disabled="codeSending || countdown > 0"
+            >
+              {{ countdown > 0 ? `${countdown}s` : (codeSending ? '发送中...' : '获取验证码') }}
+            </button>
           </div>
         </div>
 
@@ -72,8 +95,13 @@ export default {
       username: '',
       password: '',
       confirmPassword: '',
+      email: '',
+      verificationCode: '',
       isLoginMode: true,
       loading: false,
+      codeSending: false,
+      countdown: 0,
+      countdownTimer: null,
       error: ''
     };
   },
@@ -81,9 +109,57 @@ export default {
     toggleMode() {
       this.isLoginMode = !this.isLoginMode;
       this.error = '';
-      // 清空密码框
+      // 清空输入框
       this.password = '';
       this.confirmPassword = '';
+      this.email = '';
+      this.verificationCode = '';
+    },
+    startCountdown() {
+      this.countdown = 60;
+      this.countdownTimer = setInterval(() => {
+        this.countdown--;
+        if (this.countdown <= 0) {
+          clearInterval(this.countdownTimer);
+          this.countdownTimer = null;
+        }
+      }, 1000);
+    },
+    async sendVerificationCode() {
+      this.error = '';
+
+      if (!this.email) {
+        this.error = '请输入邮箱地址';
+        return;
+      }
+
+      // 简单的邮箱格式验证
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(this.email)) {
+        this.error = '邮箱格式不正确';
+        return;
+      }
+
+      this.codeSending = true;
+
+      try {
+        const response = await axios.post('/api/send-verification-code', {
+          email: this.email
+        });
+
+        if (response.data.success) {
+          this.startCountdown();
+          this.error = '';
+          alert('验证码已发送，请查收邮件');
+        } else {
+          this.error = response.data.message;
+        }
+      } catch (err) {
+        this.error = '发送失败，请稍后重试';
+        console.error(err);
+      } finally {
+        this.codeSending = false;
+      }
     },
     async handleAuth() {
       this.error = '';
@@ -98,27 +174,45 @@ export default {
           this.error = '两次输入的密码不一致';
           return;
         }
+        if (!this.email) {
+          this.error = '请输入邮箱地址';
+          return;
+        }
+        if (!this.verificationCode) {
+          this.error = '请输入验证码';
+          return;
+        }
       }
 
       this.loading = true;
       const endpoint = this.isLoginMode ? '/api/login' : '/api/register';
 
       try {
-        const response = await axios.post(endpoint, {
+        const payload = {
           username: this.username,
           password: this.password
-        });
+        };
+
+        // 注册时添加邮箱和验证码
+        if (!this.isLoginMode) {
+          payload.email = this.email;
+          payload.verification_code = this.verificationCode;
+        }
+
+        const response = await axios.post(endpoint, payload);
 
         if (response.data.success) {
           if (this.isLoginMode) {
             this.$router.push('/');
           } else {
             this.isLoginMode = true;
-            this.error = ''; // 清除错误
-            alert('注册成功，请登录'); // 简单的提示，或者使用更优雅的通知组件
+            this.error = '';
+            alert('注册成功，请登录');
             this.username = '';
             this.password = '';
             this.confirmPassword = '';
+            this.email = '';
+            this.verificationCode = '';
           }
         } else {
           this.error = response.data.message;
@@ -129,6 +223,12 @@ export default {
       } finally {
         this.loading = false;
       }
+    }
+  },
+  beforeUnmount() {
+    // 清除倒计时定时器
+    if (this.countdownTimer) {
+      clearInterval(this.countdownTimer);
     }
   }
 };
@@ -210,8 +310,41 @@ export default {
 }
 
 .expand-wrapper.is-expanded {
-  max-height: 60px; /* 足够容纳输入框的高度 */
+  max-height: 220px; /* 足够容纳多个输入框的高度 */
   opacity: 1;
+}
+
+.expand-wrapper .input-group {
+  margin-bottom: 12px;
+}
+
+.verification-group {
+  display: flex;
+  gap: 10px;
+}
+
+.verification-group input {
+  flex: 1;
+}
+
+.send-code-btn {
+  padding: 12px 16px;
+  background-color: #333;
+  color: #fff;
+  border-radius: 8px;
+  font-size: 13px;
+  white-space: nowrap;
+  transition: background-color 0.3s;
+  min-width: 100px;
+}
+
+.send-code-btn:hover:not(:disabled) {
+  background-color: #555;
+}
+
+.send-code-btn:disabled {
+  background-color: #999;
+  cursor: not-allowed;
 }
 
 .auth-btn {

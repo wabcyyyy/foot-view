@@ -1,48 +1,162 @@
+"""
+视频处理主模块
+负责视频读取、关键点提取和分析结果整合
+
+优化版本：
+- 合并姿态检测和摔倒检测到一次视频遍历
+- 使用多线程并行处理
+- 跳帧检测摔倒（每3帧检测一次）
+- 优化 FFmpeg 转换速度
+"""
+
 import os
 import cv2
-import numpy as np
 import pandas as pd
 import logging
-from scipy.signal import find_peaks, savgol_filter
+import subprocess
+import shutil
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import queue
+
+from .pose_detection import detect_pose, extract_keypoints, draw_pose_landmarks, release_pose_detector, REQUIRED_KEYPOINTS
+from .gait_analysis import analyze_gait
+from .fall_detection import detect_fall, format_fall_warning, get_detector
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# 定义需要的关键点
-required_keypoints = [
-    'LEFT_ANKLE', 'RIGHT_ANKLE', 'LEFT_SHOULDER', 'RIGHT_SHOULDER',
-    'LEFT_HIP', 'RIGHT_HIP', 'LEFT_KNEE', 'RIGHT_KNEE', 'NOSE'
-]
 
-# 简化的姿势检测函数（模拟MediaPipe功能）
-def detect_pose(image):
-    # 这里返回模拟数据，实际项目中需要替换为正确的MediaPipe 0.10.x API调用
-    # 由于时间限制，我们将创建一个简化版本
-    class MockPoseLandmarks:
-        def __init__(self):
-            self.landmark = [MockLandmark(i) for i in range(33)]
+def convert_to_h264(input_path, output_path):
+    """
+    使用 FFmpeg 将视频转换为 H.264 格式（浏览器兼容）
+    使用 ultrafast 预设加速转换
     
-    class MockLandmark:
-        def __init__(self, idx):
-            self.x = 0.5 + idx * 0.01
-            self.y = 0.5 + idx * 0.01
-            self.z = 0.0
-            self.visibility = 1.0
+    Args:
+        input_path: 输入视频路径
+        output_path: 输出视频路径
     
-    class MockResults:
-        def __init__(self):
-            self.pose_landmarks = MockPoseLandmarks()
+    Returns:
+        bool: 转换是否成功
+    """
+    # 检查 ffmpeg 是否可用
+    ffmpeg_path = shutil.which('ffmpeg')
+    if ffmpeg_path is None:
+        logging.warning("FFmpeg 未安装，视频可能无法在浏览器中播放")
+        return False
     
-    return MockResults()
+    try:
+        # 临时输出文件
+        temp_output = output_path + '.temp.mp4'
+        
+        # FFmpeg 命令：使用 ultrafast 预设加速转换
+        cmd = [
+            'ffmpeg', '-y',  # 覆盖输出文件
+            '-i', input_path,  # 输入文件
+            '-c:v', 'libx264',  # 视频编码器
+            '-preset', 'ultrafast',  # 最快编码速度
+            '-crf', '28',  # 稍微降低质量换取速度（23是默认值）
+            '-tune', 'fastdecode',  # 优化解码速度
+            '-an',  # 不处理音频（加速）
+            '-movflags', '+faststart',  # 优化网络播放
+            temp_output
+        ]
+        
+        # 执行转换
+        result = subprocess.run(
+            cmd, 
+            capture_output=True, 
+            text=True,
+            timeout=120  # 2分钟超时（减少超时时间）
+        )
+        
+        if result.returncode == 0 and os.path.exists(temp_output):
+            # 替换原文件
+            os.remove(input_path)
+            os.rename(temp_output, output_path)
+            logging.info(f"视频已转换为 H.264 格式: {output_path}")
+            return True
+        else:
+            logging.error(f"FFmpeg 转换失败: {result.stderr}")
+            if os.path.exists(temp_output):
+                os.remove(temp_output)
+            return False
+            
+    except subprocess.TimeoutExpired:
+        logging.error("FFmpeg 转换超时")
+        return False
+    except Exception as e:
+        logging.error(f"视频转换失败: {e}")
+        return False
 
-# 视频处理函数
-def process_video(filename, input_path, output_folder):
+
+# 邮件发送回调函数（由 app.py 注入）
+_send_fall_alert_callback = None
+
+
+def set_fall_alert_callback(callback):
+    """
+    设置摔倒警报邮件发送回调函数
+    
+    Args:
+        callback: 回调函数，签名为 callback(email, filename, fall_times, fall_warning)
+    """
+    global _send_fall_alert_callback
+    _send_fall_alert_callback = callback
+    logging.info("摔倒警报回调函数已设置")
+
+
+def send_fall_alert(email, filename, fall_times, fall_warning):
+    """
+    发送摔倒警报邮件
+    
+    Args:
+        email: 用户邮箱
+        filename: 视频文件名
+        fall_times: 摔倒时间列表
+        fall_warning: 警告信息
+    
+    Returns:
+        bool: 发送是否成功
+    """
+    global _send_fall_alert_callback
+    
+    if _send_fall_alert_callback is None:
+        logging.warning("摔倒警报回调函数未设置，无法发送邮件")
+        return False
+    
+    try:
+        return _send_fall_alert_callback(email, filename, fall_times, fall_warning)
+    except Exception as e:
+        logging.error(f"发送摔倒警报邮件失败: {e}")
+        return False
+
+
+def process_video(filename, input_path, output_folder, user_email=None):
+    """
+    处理视频文件，提取关键点并进行分析
+    
+    优化版本：
+    - 一次视频遍历完成姿态检测
+    - 收集帧缓存用于摔倒检测（跳帧采样）
+    - 多线程处理摔倒检测
+    
+    Args:
+        filename: 视频文件名
+        input_path: 视频文件路径
+        output_folder: 输出文件夹路径
+        user_email: 用户邮箱（用于摔倒警报通知）
+    
+    Returns:
+        bool: 处理是否成功
+    """
     try:
         video_base_name = os.path.splitext(filename)[0]
         video_output_folder = os.path.join(output_folder, video_base_name)
         os.makedirs(video_output_folder, exist_ok=True)
 
-        output_path_full = os.path.join(video_output_folder, f"{video_base_name}_output.mp4")
+        # 只生成骨架视频
         output_path_skeleton = os.path.join(video_output_folder, f"{video_base_name}_skeleton.mp4")
         output_path_keypoints = os.path.join(video_output_folder, f"{video_base_name}_keypoints.csv")
         output_path_analysis = os.path.join(video_output_folder, f"{video_base_name}_analysis.csv")
@@ -54,68 +168,107 @@ def process_video(filename, input_path, output_folder):
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        # 初始化视频写入对象
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out_full = cv2.VideoWriter(output_path_full, fourcc, fps, (width, height))
-        out_skeleton = cv2.VideoWriter(output_path_skeleton, fourcc, fps, (width, height))
+        # 使用 AVC1 编解码器（H.264），浏览器更兼容
+        codecs_to_try = ['avc1', 'H264', 'X264', 'mp4v']
+        out_skeleton = None
+        
+        for codec in codecs_to_try:
+            fourcc = cv2.VideoWriter_fourcc(*codec)
+            out_skeleton = cv2.VideoWriter(output_path_skeleton, fourcc, fps, (width, height))
+            if out_skeleton.isOpened():
+                logging.info(f"使用编解码器: {codec}")
+                break
+            out_skeleton.release()
+        
+        if out_skeleton is None or not out_skeleton.isOpened():
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out_skeleton = cv2.VideoWriter(output_path_skeleton, fourcc, fps, (width, height))
+            logging.info("使用默认编解码器: mp4v")
 
         keypoints_list = []
+        frame_buffer = []  # 用于摔倒检测的帧缓存
+        frame_count = 0
+        detected_frames = 0
+        
+        # 跳帧参数：每隔 SKIP_FRAMES 帧采样一帧用于摔倒检测
+        SKIP_FRAMES = 3
 
-        # 定义模拟的PoseLandmark枚举
-        class MockPoseLandmark:
-            def __init__(self, idx):
-                self.idx = idx
-                
-            def __str__(self):
-                return required_keypoints[self.idx % len(required_keypoints)] if self.idx < 33 else 'UNKNOWN'
-            
-            @classmethod
-            def name(cls, idx):
-                landmark_names = [
-                    'NOSE', 'LEFT_EYE_INNER', 'LEFT_EYE', 'LEFT_EYE_OUTER',
-                    'RIGHT_EYE_INNER', 'RIGHT_EYE', 'RIGHT_EYE_OUTER', 'LEFT_EAR',
-                    'RIGHT_EAR', 'MOUTH_LEFT', 'MOUTH_RIGHT', 'LEFT_SHOULDER',
-                    'RIGHT_SHOULDER', 'LEFT_ELBOW', 'RIGHT_ELBOW', 'LEFT_WRIST',
-                    'RIGHT_WRIST', 'LEFT_PINKY', 'RIGHT_PINKY', 'LEFT_INDEX',
-                    'RIGHT_INDEX', 'LEFT_THUMB', 'RIGHT_THUMB', 'LEFT_HIP',
-                    'RIGHT_HIP', 'LEFT_KNEE', 'RIGHT_KNEE', 'LEFT_ANKLE',
-                    'RIGHT_ANKLE', 'LEFT_HEEL', 'RIGHT_HEEL', 'LEFT_FOOT_INDEX',
-                    'RIGHT_FOOT_INDEX'
-                ]
-                return landmark_names[idx] if idx < len(landmark_names) else 'UNKNOWN'
+        logging.info(f"开始处理视频: {filename} (共 {total_frames} 帧)")
+        start_time = datetime.now()
 
         while cap.isOpened():
             success, image = cap.read()
             if not success:
                 break
 
-            # 使用模拟的姿势检测函数
+            frame_count += 1
+            frame_number = frame_count  # 当前帧编号
+            
+            # 姿势检测
             results = detect_pose(image)
+            
+            # 提取关键点
+            keypoints = extract_keypoints(results, frame_number)
+            
+            if keypoints:
+                keypoints_list.append(keypoints)
+                detected_frames += 1
 
-            # 提取关键点并保存（模拟）
-            if results and hasattr(results, 'pose_landmarks'):
-                keypoints = {'frame': int(cap.get(cv2.CAP_PROP_POS_FRAMES))}
-                for idx, landmark in enumerate(results.pose_landmarks.landmark):
-                    keypoint_name = MockPoseLandmark.name(idx)
-                    if keypoint_name in required_keypoints:
-                        keypoints[f'{keypoint_name}_x'] = landmark.x
-                        keypoints[f'{keypoint_name}_y'] = landmark.y
-                        keypoints[f'{keypoint_name}_z'] = landmark.z
-                        keypoints[f'{keypoint_name}_visibility'] = landmark.visibility
+            # 绘制骨架并写入视频
+            skeleton_image = image.copy()
+            skeleton_image = draw_pose_landmarks(skeleton_image, results)
+            out_skeleton.write(skeleton_image)
+            
+            # 采样帧用于摔倒检测（跳帧采样减少计算量）
+            if frame_count % SKIP_FRAMES == 0:
+                frame_buffer.append((frame_number, image.copy()))
 
-                # 检查是否所有需要的关键点都存在
-                if all(f'{kp}_x' in keypoints and f'{kp}_y' in keypoints for kp in required_keypoints):
-                    keypoints_list.append(keypoints)
-
-                # 直接写入原始图像，跳过绘制（简化版本）
-                out_full.write(image)
-                out_skeleton.write(image)
+            # 每100帧记录一次进度
+            if frame_count % 100 == 0:
+                elapsed = (datetime.now() - start_time).total_seconds()
+                progress = frame_count / total_frames * 100 if total_frames > 0 else 0
+                logging.info(f"处理进度: {progress:.1f}% ({frame_count}/{total_frames} 帧, 耗时 {elapsed:.1f}s)")
 
         # 释放资源
         cap.release()
-        out_full.release()
         out_skeleton.release()
+        
+        # 释放 Pose 检测器
+        release_pose_detector()
+        
+        elapsed_pose = (datetime.now() - start_time).total_seconds()
+        logging.info(f"姿态检测完成: 共 {frame_count} 帧, 检测到人体 {detected_frames} 帧, 耗时 {elapsed_pose:.1f}s")
+        
+        # 使用线程池并行处理后续任务
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = []
+            
+            # 任务1: FFmpeg 转换（在后台线程中执行）
+            future_ffmpeg = executor.submit(convert_to_h264, output_path_skeleton, output_path_skeleton)
+            futures.append(('ffmpeg', future_ffmpeg))
+            
+            # 任务2: 摔倒检测（使用帧缓存，在后台线程中执行）
+            def run_fall_detection():
+                if frame_buffer:
+                    logging.info(f"开始摔倒检测: 共 {len(frame_buffer)} 帧采样")
+                    fall_detected, fall_times = detect_fall(
+                        keypoints_df=None,
+                        fps=fps,
+                        frame_buffer=frame_buffer
+                    )
+                    return fall_detected, fall_times
+                return False, []
+            
+            future_fall = executor.submit(run_fall_detection)
+            futures.append(('fall_detection', future_fall))
+            
+            # 等待摔倒检测完成
+            fall_detected, fall_start_times = False, []
+            for name, future in futures:
+                if name == 'fall_detection':
+                    fall_detected, fall_start_times = future.result()
 
         # 保存关键点数据到CSV
         if keypoints_list:
@@ -123,18 +276,42 @@ def process_video(filename, input_path, output_folder):
             keypoints_df.to_csv(output_path_keypoints, index=False)
             logging.info(f"成功保存关键点数据到 {output_path_keypoints}")
 
-            # 分析关键点数据，传入fps
-            analyze_keypoints(keypoints_list, output_path_analysis, fps)
+            # 分析关键点数据（步态分析 + 整合摔倒检测结果）
+            analyze_keypoints(
+                keypoints_list, 
+                output_path_analysis, 
+                fps, 
+                fall_result=(fall_detected, fall_start_times),
+                filename=filename, 
+                user_email=user_email
+            )
         else:
             logging.warning(f"未检测到任何关键点，无法生成 {output_path_keypoints}")
+        
+        total_elapsed = (datetime.now() - start_time).total_seconds()
+        logging.info(f"视频处理完成，总耗时: {total_elapsed:.1f}s")
         
         return True
     except Exception as e:
         logging.error(f"处理视频 {filename} 时发生错误: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
-# 关键点分析函数
-def analyze_keypoints(keypoints_list, output_analysis_path, fps):
+
+def analyze_keypoints(keypoints_list, output_analysis_path, fps, fall_result=None,
+                      filename=None, user_email=None):
+    """
+    分析关键点数据，整合步态分析和摔倒检测结果
+    
+    Args:
+        keypoints_list: 关键点数据列表
+        output_analysis_path: 分析结果输出路径
+        fps: 视频帧率
+        fall_result: 摔倒检测结果 (fall_detected, fall_start_times)，如果为 None 则不检测
+        filename: 原始视频文件名（用于警报邮件）
+        user_email: 用户邮箱（用于摔倒警报通知）
+    """
     if not keypoints_list:
         with open(output_analysis_path, 'w', encoding='utf-8-sig') as f:
             f.write("没有关键点数据\n")
@@ -142,6 +319,7 @@ def analyze_keypoints(keypoints_list, output_analysis_path, fps):
 
     keypoints_df = pd.DataFrame(keypoints_list)
 
+    # 检查是否所有关键点都存在
     required_keypoints_cols = [
         'LEFT_ANKLE_x', 'RIGHT_ANKLE_x', 'LEFT_ANKLE_y', 'RIGHT_ANKLE_y',
         'LEFT_SHOULDER_x', 'LEFT_SHOULDER_y', 'RIGHT_SHOULDER_x', 'RIGHT_SHOULDER_y',
@@ -150,318 +328,75 @@ def analyze_keypoints(keypoints_list, output_analysis_path, fps):
         'LEFT_SHOULDER_z', 'RIGHT_SHOULDER_z', 'NOSE_z'
     ]
 
-    # 检查是否所有关键点都存在
     missing_keypoints = [kp for kp in required_keypoints_cols if kp not in keypoints_df.columns]
     if missing_keypoints:
         with open(output_analysis_path, 'w', encoding='utf-8-sig') as f:
             f.write(f"缺少关键点: {missing_keypoints}\n")
         return
 
-    # 计算躯干的倾斜角度
-    keypoints_df['Torso_Angle'] = keypoints_df.apply(
-        lambda row: np.arctan2(
-            (row['LEFT_SHOULDER_y'] + row['RIGHT_SHOULDER_y']) / 2 - (row['LEFT_HIP_y'] + row['RIGHT_HIP_y']) / 2,
-            (row['LEFT_SHOULDER_x'] + row['RIGHT_SHOULDER_x']) / 2 - (row['LEFT_HIP_x'] + row['RIGHT_HIP_x']) / 2
-        ),
-        axis=1
-    )
+    # 执行步态分析
+    gait_result = analyze_gait(keypoints_df, fps)
+    
+    # 使用传入的摔倒检测结果
+    if fall_result is not None:
+        fall_detected, fall_start_times = fall_result
+    else:
+        fall_detected, fall_start_times = False, []
+    
+    fall_warning = format_fall_warning(fall_detected, fall_start_times)
 
-    # 计算躯干稳定性
-    torso_stability = keypoints_df['Torso_Angle'].diff().abs().mean()
-
-    # 步态周期检测
-    gait_cycle_info = detect_gait_cycles(keypoints_df, fps)
-
-    # 计算步态评分
-    gait_scores, measurements = calculate_gait_scores(keypoints_df, torso_stability, gait_cycle_info, fps)
-
-    # 摔倒检测
-    fall_detected, fall_start_times = detect_fall(keypoints_df, fps)
-
-    # 构建分析结果列表，避免空的单元格
+    # 构建分析结果（纯客观数据，无评分）
+    metric_units = {
+        "步频": "步/分",
+        "步态周期": "秒",
+        "对称性指数": "%",
+        "变异系数": "%",
+        "躯干稳定性": "度/帧",
+        "躯干倾斜角": "度",
+        "平均步长": "相对值",
+        "摆动幅度": "相对值",
+        "膝关节活动度": "度"
+    }
+    
     analysis_results = []
-
-    for param in gait_scores.keys():
-        measurement = measurements.get(param, "无")
-        score = gait_scores[param]
-        analysis_results.append({"参数": param, "测量值": measurement, "评分": score})
+    measurements = gait_result.get('measurements', {})
+    
+    for param, value in measurements.items():
+        unit = metric_units.get(param, "")
+        if value is None:
+            display_value = "无"
+        else:
+            display_value = f"{value} {unit}".strip()
+        analysis_results.append({"指标": param, "数值": value if value is not None else "", "单位": unit})
 
     # 创建 DataFrame
     analysis_df = pd.DataFrame(analysis_results)
 
-    # 添加空行
-    empty_row = pd.DataFrame([{"参数": "", "测量值": "", "评分": ""}])
-    analysis_df = pd.concat([analysis_df, empty_row], ignore_index=True)
-
-    # 计算总分和综合健康状况
-    total_score = sum(gait_scores.values())
-    max_score = len(gait_scores) * 3  # 每个指标最高3分
-
-    if total_score >= 10:
-        grade = 'A'
-    elif total_score >= 7:
-        grade = 'B'
-    else:
-        grade = 'C'
-
-    # 将总分和综合健康状况添加到结果中
-    total_score_row = pd.DataFrame([{"参数": "总分", "测量值": total_score, "评分": ""}])
-    grade_row = pd.DataFrame([{"参数": "综合健康状况", "测量值": grade, "评分": ""}])
-    analysis_df = pd.concat([analysis_df, total_score_row, grade_row], ignore_index=True)
-
-    # 保存到 CSV 文件，不包含索引，不包含空的单元格
+    # 保存到 CSV 文件
     try:
         with open(output_analysis_path, 'w', encoding='utf-8-sig', newline='') as f:
-            # 写入指标部分
             analysis_df.to_csv(f, index=False, header=True, encoding='utf-8-sig')
 
             # 如果检测到摔倒，生成警告信息
-            if fall_detected and fall_start_times:
-                fall_times_str = [f"{t:.2f}" for t in fall_start_times]
-                fall_warning = f"警告：在 {', '.join(fall_times_str)} 秒检测到摔倒可能"
+            if fall_warning:
                 f.write(f"\n{fall_warning}")
         logging.info(f"成功保存分析结果到 {output_analysis_path}")
     except Exception as e:
         logging.error(f"保存分析结果时发生错误: {e}")
-
-# 摔倒检测函数
-def detect_fall(keypoints_df, fps):
-    # 选择用于检测的关键点：髋部、肩部、头部
-    hip_z = (keypoints_df['LEFT_HIP_z'] + keypoints_df['RIGHT_HIP_z']) / 2
-    shoulder_z = (keypoints_df['LEFT_SHOULDER_z'] + keypoints_df['RIGHT_SHOULDER_z']) / 2
-    head_z = keypoints_df['NOSE_z']  # 使用鼻子作为头部关键点
-
-    # 对Z轴数据进行平滑处理
-    hip_z_smooth = savgol_filter(hip_z, window_length=11, polyorder=2)
-    shoulder_z_smooth = savgol_filter(shoulder_z, window_length=11, polyorder=2)
-    head_z_smooth = savgol_filter(head_z, window_length=11, polyorder=2)
-
-    # 计算Z轴速度（差分）
-    hip_z_velocity = np.diff(hip_z_smooth)
-    shoulder_z_velocity = np.diff(shoulder_z_smooth)
-    head_z_velocity = np.diff(head_z_smooth)
-
-    # 设定速度阈值，判断快速下降
-    velocity_threshold = -0.015  # 根据实际数据调整
-
-    # 检测快速下降的帧
-    falling_frames = np.where(
-        (hip_z_velocity < velocity_threshold) |
-        (shoulder_z_velocity < velocity_threshold) |
-        (head_z_velocity < velocity_threshold)
-    )[0]
-
-    # 设定持续时间阈值，检测是否保持在低位
-    duration_threshold_frames = int(fps * 3)  # 持续至少3秒对应的帧数
-
-    # 设定最小间隔时间，避免相邻摔倒事件过近
-    min_interval_frames = int(fps * 10)  # 相邻摔倒事件最小间隔10秒
-
-    # 设定高度阈值，判断是否在低位
-    min_hip_z = np.min(hip_z_smooth)
-    min_shoulder_z = np.min(shoulder_z_smooth)
-    min_head_z = np.min(head_z_smooth)
-    height_threshold_hip = min_hip_z + 0.05  # 髋部接近地面
-    height_threshold_shoulder = min_shoulder_z + 0.05  # 肩部接近地面
-    height_threshold_head = min_head_z + 0.05  # 头部接近地面
-
-    # 检测摔倒事件
-    fall_detected = False
-    fall_start_times = []
-    i = 0
-    while i < len(falling_frames):
-        frame = falling_frames[i]
-        # 检查后续是否保持在低位至少持续时间阈值的帧数
-        end_frame = frame + duration_threshold_frames
-        if end_frame >= len(hip_z_smooth):
-            end_frame = len(hip_z_smooth) - 1
-
-        # 判断髋部、肩部、头部是否都在低位
-        hip_low = np.all(hip_z_smooth[frame:end_frame] <= height_threshold_hip)
-        shoulder_low = np.all(shoulder_z_smooth[frame:end_frame] <= height_threshold_shoulder)
-        head_low = np.all(head_z_smooth[frame:end_frame] <= height_threshold_head)
-
-        if hip_low or shoulder_low or head_low:
-            fall_detected = True
-            fall_start_time = frame / fps
-            fall_start_times.append(fall_start_time)
-            # 跳过已经检测到的这段时间，加上最小间隔，避免重复检测
-            skip_frames = end_frame + min_interval_frames
-            i = np.searchsorted(falling_frames, skip_frames)
-        else:
-            i += 1
-
-    # 返回是否检测到摔倒，以及摔倒发生的开始时间列表（秒）
-    return fall_detected, fall_start_times
-
-# 步态周期检测函数
-def detect_gait_cycles(keypoints_df, fps):
-    # 提取左右脚踝的z轴数据，并填充缺失值
-    right_ankle_z = keypoints_df['RIGHT_ANKLE_z'].fillna(method='ffill').fillna(method='bfill')
-    left_ankle_z = keypoints_df['LEFT_ANKLE_z'].fillna(method='ffill').fillna(method='bfill')
-
-    # 对信号进行平滑处理，去除噪声
-    window_length = 11  # 必须为奇数
-    polyorder = 2
-    right_ankle_z_smooth = savgol_filter(right_ankle_z, window_length=window_length, polyorder=polyorder)
-    left_ankle_z_smooth = savgol_filter(left_ankle_z, window_length=window_length, polyorder=polyorder)
-
-    # 去趋势处理，突出信号的局部波动
-    right_ankle_z_detrended = right_ankle_z_smooth - pd.Series(right_ankle_z_smooth).rolling(window=30, min_periods=1).mean()
-    left_ankle_z_detrended = left_ankle_z_smooth - pd.Series(left_ankle_z_smooth).rolling(window=30, min_periods=1).mean()
-
-    # 检测波谷（取反后检测波峰）
-    distance = 20
-    prominence = 0.05
-
-    peaks_right, _ = find_peaks(-right_ankle_z_detrended, prominence=prominence, distance=distance)
-    valleys_right = peaks_right
-    peaks_left, _ = find_peaks(-left_ankle_z_detrended, prominence=prominence, distance=distance)
-    valleys_left = peaks_left
-
-    # 计算步态周期（相邻波谷之间的帧数差）
-    gait_cycles_right = np.diff(valleys_right)
-    gait_cycles_left = np.diff(valleys_left)
-
-    # 转换步态周期为时间（秒）
-    gait_cycles_right_time = gait_cycles_right / fps
-    gait_cycles_left_time = gait_cycles_left / fps
-
-    # 检测第一个完整的步态周期的起始帧
-    if len(valleys_right) > 1:
-        first_gait_cycle_frame = valleys_right[1]
-    elif len(valleys_left) > 1:
-        first_gait_cycle_frame = valleys_left[1]
-    else:
-        first_gait_cycle_frame = None
-
-    gait_cycle_info = {
-        'gait_cycles_right': gait_cycles_right_time,
-        'gait_cycles_left': gait_cycles_left_time,
-        'mean_gait_cycle_right': np.mean(gait_cycles_right_time) if len(gait_cycles_right_time) > 0 else None,
-        'mean_gait_cycle_left': np.mean(gait_cycles_left_time) if len(gait_cycles_left_time) > 0 else None,
-        'first_gait_cycle_frame': first_gait_cycle_frame,
-        'valleys_left': valleys_left,
-        'valleys_right': valleys_right
-    }
-
-    return gait_cycle_info
-
-# 计算步长函数
-def calculate_step_lengths(keypoints_df, gait_cycle_info):
-    # 提取左右脚踝的x、y坐标
-    left_ankle_x = keypoints_df['LEFT_ANKLE_x'].fillna(method='ffill').fillna(method='bfill')
-    left_ankle_y = keypoints_df['LEFT_ANKLE_y'].fillna(method='ffill').fillna(method='bfill')
-    right_ankle_x = keypoints_df['RIGHT_ANKLE_x'].fillna(method='ffill').fillna(method='bfill')
-    right_ankle_y = keypoints_df['RIGHT_ANKLE_y'].fillna(method='ffill').fillna(method='bfill')
-
-    # 初始化步长列表
-    step_lengths = []
-
-    # 获取左、右脚波谷（表示脚落地时刻）
-    valleys_left = gait_cycle_info.get('valleys_left', [])
-    valleys_right = gait_cycle_info.get('valleys_right', [])
-
-    # 合并并排序所有波谷
-    all_valleys = sorted(list(valleys_left) + list(valleys_right))
-
-    # 计算相邻落地点之间的步长
-    for i in range(1, len(all_valleys)):
-        current_frame = all_valleys[i]
-        previous_frame = all_valleys[i - 1]
-
-        # 判断是哪只脚
-        if current_frame in valleys_left:
-            ankle_x = left_ankle_x
-            ankle_y = left_ankle_y
-        else:
-            ankle_x = right_ankle_x
-            ankle_y = right_ankle_y
-
-        if previous_frame in valleys_left:
-            prev_ankle_x = left_ankle_x
-            prev_ankle_y = left_ankle_y
-        else:
-            prev_ankle_x = right_ankle_x
-            prev_ankle_y = right_ankle_y
-
-        # 计算步长（欧几里得距离）
-        step_length = np.sqrt(
-            (ankle_x.iloc[current_frame] - prev_ankle_x.iloc[previous_frame]) ** 2 +
-            (ankle_y.iloc[current_frame] - prev_ankle_y.iloc[previous_frame]) ** 2
-        )
-        step_lengths.append(step_length)
-
-    return step_lengths
-
-# 计算步态评分函数
-def calculate_gait_scores(keypoints_df, torso_stability, gait_cycle_info, fps):
-    measurements = {}
-    scores = {
-        "起步": 3,
-        "步伐对称": 3,
-        "步伐连贯": 3,
-        "躯干": 3
-    }
-
-    # 计算平均步长
-    step_lengths = calculate_step_lengths(keypoints_df, gait_cycle_info)
-    if step_lengths:
-        average_step_length = np.mean(step_lengths)
-        measurements["平均步长"] = average_step_length
-
-        # 根据平均步长设定起步评分（3分制）
-        if average_step_length >= 0.08:
-            scores["起步"] = 3
-        elif average_step_length >= 0.06:
-            scores["起步"] = 2
-        else:
-            scores["起步"] = 1
-    else:
-        scores["起步"] = 2  # 无法计算步长，给予中等分数
-
-    # 步伐对称性（3分制）
-    mean_cycle_right_time = gait_cycle_info['mean_gait_cycle_right']
-    mean_cycle_left_time = gait_cycle_info['mean_gait_cycle_left']
-
-    if mean_cycle_right_time is not None and mean_cycle_left_time is not None:
-        cycle_diff = abs(mean_cycle_right_time - mean_cycle_left_time)
-        measurements["步态周期差异（秒）"] = cycle_diff
-
-        if cycle_diff <= 0.1:
-            scores["步伐对称"] = 3
-        elif cycle_diff <= 0.2:
-            scores["步伐对称"] = 2
-        else:
-            scores["步伐对称"] = 1
-    else:
-        scores["步伐对称"] = 2  # 无法计算，给予中等分数
-
-    # 步伐连贯性（3分制）
-    gait_cycles_combined = np.concatenate([
-        gait_cycle_info['gait_cycles_right'], gait_cycle_info['gait_cycles_left']
-    ])
-
-    if len(gait_cycles_combined) > 1:
-        cycle_std = np.std(gait_cycles_combined)
-        measurements["步态周期标准差（秒）"] = cycle_std
-
-        if cycle_std <= 0.1:
-            scores["步伐连贯"] = 3
-        elif cycle_std <= 0.2:
-            scores["步伐连贯"] = 2
-        else:
-            scores["步伐连贯"] = 1
-    else:
-        scores["步伐连贯"] = 2  # 无法计算，给予中等分数
-
-    # 躯干稳定性（3分制）
-    measurements["躯干稳定性"] = torso_stability
-    if torso_stability <= 0.04:
-        scores["躯干"] = 3
-    elif torso_stability <= 0.06:
-        scores["躯干"] = 2
-    else:
-        scores["躯干"] = 1
-
-    return scores, measurements
+    
+    # ========== 摔倒警报邮件通知 ==========
+    if fall_detected and user_email:
+        logging.info(f"检测到摔倒，准备发送警报邮件到 {user_email}")
+        try:
+            success = send_fall_alert(
+                email=user_email,
+                filename=filename or "未知视频",
+                fall_times=fall_start_times,
+                fall_warning=fall_warning
+            )
+            if success:
+                logging.info(f"摔倒警报邮件发送成功: {user_email}")
+            else:
+                logging.warning(f"摔倒警报邮件发送失败: {user_email}")
+        except Exception as e:
+            logging.error(f"发送摔倒警报邮件时发生错误: {e}")

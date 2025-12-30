@@ -1,0 +1,12 @@
+# Fall Detection Dataset
+# YOLO 目标检测格式
+
+path: D:\wcy\note\互联网+\foot-view\training\dataset_detect
+train: images/train
+val: images/val
+
+# 类别
+nc: 2
+names:
+  0: fall
+  1: not_fall
